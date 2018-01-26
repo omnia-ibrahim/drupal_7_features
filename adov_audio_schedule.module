@@ -1,0 +1,688 @@
+<?php
+
+/**
+ * @file
+ * Code for the Audio Schedule feature.
+ */
+
+include_once 'adov_audio_schedule.features.inc';
+
+/**
+ * Implements hook_menu().
+ */
+function adov_audio_schedule_menu() {
+  $items['audio-schedule-campaigns/autocomplete/%'] = array(
+    'page callback' => 'adov_audio_schedule_default_campaigns_autocomplete',
+    'page arguments' => array(2),
+    'access arguments' => array('access content'),
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}
+
+/**
+ * Creates the JSON that drives the autocomplete for Default Campaigns.
+ */
+function adov_audio_schedule_default_campaigns_autocomplete($local_market, $text) {
+  $matches = array();
+
+  // Get result from default campaign view.
+  $view_object = views_get_view("default_campaign_schedule");
+  $view_object->set_display("entityreference_1");
+  $view_object->set_arguments(array($local_market));
+  $entityreference_options = array(
+    'match' => $text,
+    'match_operator' => 'CONTAINS',
+    'limit' => 0,
+  );
+  $view_object->display_handler->set_option('entityreference_options', $entityreference_options);
+  $view_object->pre_execute();
+  $view_object->execute();
+  $campaigns = $view_object->result;
+
+  $default_campaigns = array();
+  foreach ($campaigns as $campaign) {
+    $default_campaigns[$campaign->nid]['title'] = $campaign->node_title;
+  }
+
+  if ($default_campaigns) {
+    foreach ($default_campaigns as $nid => $campaign) {
+      $matches[$campaign['title'] . ' (' . $nid . ')'] = check_plain($campaign['title']);
+    }
+  }
+
+  // Return default campaigns.
+  drupal_json_output($matches);
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function adov_audio_schedule_form_alter(&$form, &$form_state) {
+  // Set default local market.
+  if (isset($form['field_local_market']) || isset($form['field_local_markets']) || isset($form['field_audio_schedules'][LANGUAGE_NONE][0]['field_local_market'])) {
+    $account = user_load($GLOBALS['user']->uid);
+    $local_market_nid = adov_editorial_get_user_local_market($account);
+    if ($local_market_nid) {
+      $entity_node = node_load($local_market_nid);
+      if (isset($form['field_local_market'])) {
+        if (empty($form['field_local_market'][LANGUAGE_NONE][0]['target_id']['#default_value'])) {
+          $form['field_local_market'][LANGUAGE_NONE][0]['target_id']['#default_value'] = "$entity_node->title ($entity_node->nid)";
+        }
+        $form['field_local_market']['#disabled'] = TRUE;
+      }
+      if (isset($form['field_local_markets'])) {
+        if (empty($form['field_local_markets'][LANGUAGE_NONE][0]['target_id']['#default_value'])) {
+          $form['field_local_markets'][LANGUAGE_NONE][0]['target_id']['#default_value'] = "$entity_node->title ($entity_node->nid)";
+        }
+        $form['field_local_markets']['#disabled'] = TRUE;
+      }
+      if (isset($form['field_audio_schedules'][LANGUAGE_NONE][0]['field_local_market']) && empty($form['field_audio_schedules'][LANGUAGE_NONE][0]['field_local_market'][LANGUAGE_NONE][0]['target_id']['#default_value'])) {
+        $form['field_audio_schedules'][LANGUAGE_NONE][0]['field_local_market'][LANGUAGE_NONE][0]['target_id']['#default_value'] = "$entity_node->title ($entity_node->nid)";
+      }
+    }
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function adov_audio_schedule_form_audio_schedule_node_form_alter(&$form, &$form_state) {
+  global $user;
+  $account = user_load($user->uid);
+
+  // Get current user Local Market ID.
+  $local_market_id = adov_editorial_get_user_local_market($account);
+  $form_state['local_market_id'] = $local_market_id;
+
+  // Do nothing if the current user does not have Local Market ID set.
+  if (empty($local_market_id)) {
+    return;
+  }
+
+  $form['audio_schedules']['#tree'] = TRUE;
+  $form['audio_schedules']['#weight'] = 4;
+
+  // Remove original field_audio_schedules field collection.
+  // It should be custom widget.
+  unset($form['field_audio_schedules']);
+
+  $form['#group_children']['audio_schedules'] = 'group_main';
+  $local_market = node_load($local_market_id);
+  $field_collection_id = 'schedule_options_' . $local_market_id;
+
+  // Build the fieldset.
+  // TODO Build separate fieldsets per Local Market.
+  $form['audio_schedules'][$field_collection_id] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Hierarchy Assignment'),
+    '#prefix' => '<div id="schedule-hierarchy-group-' . $local_market_id . '" class="schedule-hierarchy-group-wrapper">',
+    '#suffix' => '</div>',
+  );
+
+  // Get the submitted value after form rebuild to set it as #default_value.
+  $filter_value = !empty($form_state['values']['audio_schedules'][$field_collection_id]['filter']) ? $form_state['values']['audio_schedules'][$field_collection_id]['filter'] : '';
+
+  // Bulid the Filter textfield.
+  $form['audio_schedules'][$field_collection_id]['filter'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Filter'),
+    '#value' => $filter_value,
+    '#default_value' => '',
+  );
+
+  // Bulid the Filter button with ajax callback attached.
+  $form['audio_schedules'][$field_collection_id]['filter_submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Filter'),
+    '#submit' => array('adov_audio_schedule_form_filter_submit'),
+    '#ajax' => array(
+      'callback' => 'adov_audio_schedule_form_filter_submit',
+      'wrapper' => 'schedule-hierarchy-group-' . $local_market_id,
+    ),
+    '#limit_validation_errors' => array(),
+    '#attributes' => array(
+      'class' => array(
+        'filter-btn',
+      ),
+    ),
+  );
+
+  $variables['hierarchy']['local_market'] = $local_market;
+  $variables['hierarchy']['regions'] = views_get_view_result('schedule_hierarchy', 'hierarchy_region', $local_market_id, $filter_value);
+  $variables['hierarchy']['stores'] = views_get_view_result('schedule_hierarchy', 'hierarchy_store', $local_market_id, $filter_value);
+
+  // Get default values.
+  $selected_options_hierarchy = $selected_options_zones = array();
+  if (!empty($form['#node']->field_audio_schedules[LANGUAGE_NONE])) {
+    $field_collection = !empty($form['#node']->field_audio_schedules[LANGUAGE_NONE][0]['entity']) ? $form['#node']->field_audio_schedules[LANGUAGE_NONE][0]['entity'] : field_collection_field_get_entity($form['#node']->field_audio_schedules[LANGUAGE_NONE][0], 'field_audio_schedules');
+    $selected_options_hierarchy = adov_schedule_get_selected_options($field_collection, array(
+      'field_local_market',
+      'field_stores',
+      'field_regions',
+    ));
+    $selected_options_zones = adov_schedule_get_selected_options($field_collection, array('field_zones'));
+  }
+
+  $variables['hierarchy']['selected'] = $selected_options_hierarchy;
+
+  // Build hierarchy tree.
+  $form['audio_schedules'][$field_collection_id]['schedule_hierarchy'] = array(
+    '#markup' => theme('adov_audio_schedule_hierarchy', $variables),
+    '#attached' => array(
+      'js' => array(
+        drupal_get_path('module', 'adov_schedule') . '/js/adov_schedule_hierarchy.js',
+      ),
+    ),
+  );
+
+  $form['scr_types_zones']['#tree'] = TRUE;
+  $form['scr_types_zones']['#weight'] = 4;
+
+  $form['#group_children']['scr_types_zones'] = 'group_main';
+
+  $form['scr_types_zones'][$field_collection_id] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Zone/s Assignment'),
+    '#prefix' => '<div id="scr-types-zones-hierarchy-group-' . $local_market_id . '" class="scr-types-zones-group-wrapper">',
+    '#suffix' => '</div>',
+  );
+
+  // Add field wrapper and override autocomplete path for audio playlist field.
+  $form['field_associated_audio_playlist'][LANGUAGE_NONE][0]['target_id']['#prefix'] = '<div id="default-campaign">';
+  $form['field_associated_audio_playlist'][LANGUAGE_NONE][0]['target_id']['#suffix'] = '</div>';
+  $form['field_associated_audio_playlist'][LANGUAGE_NONE][0]['target_id']['#autocomplete_path'] = 'audio-schedule-campaigns/autocomplete/' . $local_market_id;
+
+  // Attach js file.
+  $form['#attached']['js'][] = drupal_get_path('module', 'adov_editorial') . '/js/adov_editorial_get_multiselect_selected_values.js';
+
+  // Get Zones available options that have sounds enabled.
+  $zones = views_get_view_result('schedule_hierarchy', 'hierarchy_zone', $local_market_id, 1);
+  $zones_options = array();
+
+  // Build Zones available options.
+  foreach ($zones as $zone) {
+    $zones_options[$zone->nid] = $zone->node_title;
+  }
+
+  // Build Zones multiselect.
+  $form['scr_types_zones'][$field_collection_id]['schedule_zones'] = array(
+    '#type' => 'multiselect',
+    '#title' => t('Zones'),
+    '#options' => $zones_options,
+    '#default_value' => $selected_options_zones,
+    '#multiple' => TRUE,
+    '#size' => 10,
+    '#weight' => 10,
+    '#prefix' => '<div class="schedule-multiselect-zones">',
+    '#suffix' => '</div>',
+    '#required' => TRUE,
+  );
+
+  // Add validate function in order to set the submitted values to the node.
+  array_unshift($form['field_schedule_dates'][LANGUAGE_NONE][0]['#element_validate'], 'adov_schedule_field_dates_validate');
+
+  $form['#validate'][] = 'adov_audio_schedule_form_audio_schedule_node_form_validate';
+  // Add after build function in order to populate form values on form error.
+  $form['#after_build'][] = 'adov_audio_schedule_after_build';
+}
+
+/**
+ * Implements hook_node_view_alter().
+ */
+function adov_audio_schedule_node_view_alter(&$build) {
+  if ($build['#bundle'] == 'audio_schedule') {
+    $build['field_schedule_dates']['#title'] = t('Schedule Start - End time');
+    // Build hierarchy widget.
+    adov_audio_schedule_build_hierarchy_widget($build);
+  }
+}
+
+/**
+ * Implements hook_node_view().
+ */
+function adov_audio_schedule_node_view($node, $view_mode, $langcode) {
+  // Append Associated Audio Schedules to Audio Schedules node view.
+  if ($node->type == 'audio_schedule' && $view_mode === 'full') {
+    adov_schedule_append_associated_ld_schedules($node->content, $node);
+  }
+}
+
+/**
+ * Validation function for the audio_schedule_node_form.
+ */
+function adov_audio_schedule_form_audio_schedule_node_form_validate($form, &$form_state) {
+  // Set multiselect field values from input.
+  // Workaround from https://www.drupal.org/node/1183916#comment-5626522
+  $form_state['values']['audio_schedules']['schedule_options_' . $form_state['local_market_id']]['schedule_zones'] = $form_state['input']['scr_types_zones']['schedule_options_' . $form_state['local_market_id']]['schedule_zones'];
+
+  $form_state['node']->schedule_target = $form_state['input']['audio_schedules'];
+
+  // @TODO set local market ID in
+  $form_state['node']->local_market_id = $form_state['local_market_id'];
+
+  // Validate end date.
+  // Check if fields are valid date/timestamp strings, because if they have been
+  // invalidated earlier, they will be object. Check if validate is triggered by
+  // submit and is not ajax callback.
+  $start_date_value = isset($form_state['values']['field_schedule_dates'][LANGUAGE_NONE][0]['value']) ? $form_state['values']['field_schedule_dates'][LANGUAGE_NONE][0]['value'] : '';
+  $end_date_value = isset($form_state['values']['field_schedule_dates'][LANGUAGE_NONE][0]['value2']) ? $form_state['values']['field_schedule_dates'][LANGUAGE_NONE][0]['value2'] : '';
+  if (
+    $form_state['triggering_element']['#type'] === 'submit' &&
+    ($start_date_value && $end_date_value) &&
+    (is_string($start_date_value) && is_string($end_date_value))
+  ) {
+    // Check if value is timestamp or date format.
+    if (
+      (is_numeric($start_date_value) && (int) $start_date_value == $start_date_value) &&
+      (is_numeric($end_date_value) && (int) $end_date_value == $end_date_value)
+    ) {
+      $start_date = (new DateTime())->setTimestamp($form_state['values']['field_schedule_dates'][LANGUAGE_NONE][0]['value']);
+      $end_date = (new DateTime())->setTimestamp($form_state['values']['field_schedule_dates'][LANGUAGE_NONE][0]['value2']);
+    }
+    else {
+      $start_date = new DateTime($form_state['values']['field_schedule_dates'][LANGUAGE_NONE][0]['value']);
+      $end_date = new DateTime($form_state['values']['field_schedule_dates'][LANGUAGE_NONE][0]['value2']);
+    }
+
+    if ($start_date && $end_date) {
+      if ($start_date->getTimestamp() === $end_date->getTimestamp()) {
+        form_set_error('field_schedule_dates', t('The End date must be greater than the Start date.'));
+      }
+      // Check if end date Time(hh:mm) is greater than start date Time(hh:mm).
+      elseif (
+        $start_date->getTimestamp() < $end_date->getTimestamp() &&
+        (int) strtr($start_date->format('H:i'), array(':' => '')) >= (int) strtr($end_date->format('H:i'), array(':' => ''))
+      ) {
+        form_set_error('field_schedule_dates', t('The Time value of End date must be greater than the Time value of Start date.'));
+      }
+    }
+  }
+  // Check campaign is selected from autocomplete and not manually added.
+  $audio_playlist_nid = $form_state['values']['field_associated_audio_playlist'][LANGUAGE_NONE][0]['target_id'];
+  if (!empty($audio_playlist_nid) && !preg_match('/^\d+$/', $audio_playlist_nid)) {
+    form_set_error('field_associated_audio_playlist', t('Invalid @value selected. Please choose a different one.', array('@value' => $audio_playlist_nid)));
+  }
+
+  // Fix: adovLD-4973.
+  if (!empty($form['nid']['#value']) && empty($form_state['input']['scr_types_zones']['schedule_options_' . $form_state['local_market_id']]['schedule_zones'])) {
+    form_set_error('scr_types_zones][schedule_options_' . $form_state['local_market_id'] . '][schedule_zones', 'Zones field is required.');
+  }
+}
+
+/**
+ * Build the hierarchy widget.
+ */
+function adov_audio_schedule_build_hierarchy_widget(&$build) {
+  $manufacturer_prefix = 'term_';
+  $weight = $build['field_audio_schedules']['#weight'];
+  $local_market_id = $build['#node']->field_local_market[LANGUAGE_NONE][0]['target_id'];
+  if (isset($build['field_audio_schedules']['#items'][0]['value'])) {
+    $ld_schedule = entity_revision_load('field_collection_item', array($build['field_audio_schedules']['#items'][0]['revision_id']));
+  }
+  else {
+    $ld_schedule = $build['field_audio_schedules']['#items'][0]['entity'];
+  }
+
+  $regions = array();
+  if (isset($ld_schedule->field_regions[LANGUAGE_NONE])) {
+    foreach ($ld_schedule->field_regions[LANGUAGE_NONE] as $region) {
+      $regions[$region['target_id']] = array();
+    }
+  }
+  $stores = array();
+  if (isset($ld_schedule->field_stores[LANGUAGE_NONE])) {
+    foreach ($ld_schedule->field_stores[LANGUAGE_NONE] as $store) {
+      $stores[$store['target_id']] = array();
+    }
+  }
+  if (isset($ld_schedule->field_local_market[LANGUAGE_NONE]) && isset($ld_schedule->field_local_market[LANGUAGE_NONE][0]['target_id'])) {
+    $selected_local_market[$ld_schedule->field_local_market[LANGUAGE_NONE][0]['target_id']] = array();
+  }
+
+  $zones = array();
+  if (isset($ld_schedule->field_zones[LANGUAGE_NONE])) {
+    foreach ($ld_schedule->field_zones[LANGUAGE_NONE] as $zone) {
+      $zone_title = node_load($zone['target_id']);
+      $zones[$zone['target_id']] = $zone_title->title;
+    }
+  }
+  list($results, $sorted_results) = adov_editorial_get_sort_hierarchy('stores_regions', $local_market_id);
+  $option_arr['field-local-market'][$local_market_id] = $sorted_results;
+
+  $all_hierarchy_elements = array();
+  $local_market = node_load($local_market_id);
+  $all_hierarchy_elements[$local_market->nid] = $local_market->title;
+  foreach ($results as $element) {
+    $all_hierarchy_elements[$element['nid']] = $element['node_title'];
+  }
+
+  $hierarchy_item_list = array();
+  foreach ($option_arr['field-local-market'] as $local_market) {
+
+    if (empty($regions) && empty($stores) && !isset($selected_local_market)) {
+      break;
+    }
+    $select_all_region = isset($selected_local_market) ? TRUE : FALSE;
+    $region_item_list = array();
+    foreach ($local_market as $region_id => $region) {
+      $select_all_store = isset($regions[$region_id]) || $select_all_region ? TRUE : FALSE;
+      $existing_stor_in_region = array_filter(array_keys($region), function ($store) use ($stores) {
+        return isset($stores[$store]);
+      });
+      if ($select_all_store || $existing_stor_in_region) {
+        $store_item_list = array();
+        foreach ($region as $store_id => $store) {
+          if ($select_all_store || isset($stores[$store_id])) {
+            $store_item_list[] = array(
+              'data' => $all_hierarchy_elements[$store_id],
+              'id' => 'store_' . $store_id,
+              'class' => array(
+                'sub-store',
+              ),
+            );
+          }
+        }
+        $class = $store_item_list ? 'with-children' : 'widthout-children';
+        $region_item_list[] = array(
+          'data' => '<div class="parent-title"><i class="fa fa-arrow" aria-hidden="true"></i><span>' . $all_hierarchy_elements[$region_id] . '</span></div>',
+          'id' => 'region' . $region_id,
+          'class' => array(
+            'sub-region',
+            $class,
+          ),
+          'children' => $store_item_list,
+        );
+      }
+    }
+    $class = $region_item_list ? 'with-children' : 'without-children';
+    $hierarchy_item_list[] = array(
+      'data' => '<div class="parent-title"><i class="fa fa-arrow" aria-hidden="true"></i><span>' . $all_hierarchy_elements[$local_market_id] . '</span></div>',
+      'id' => 'local_market',
+      'class' => array(
+        'item',
+        $class,
+      ),
+      'children' => $region_item_list,
+    );
+  }
+  $build['field_audio_schedules'] = array(
+    '#title' => t('Assigned hierarchy:'),
+    '#weight' => $weight,
+    '#theme' => 'item_list',
+    '#attributes' => array('class' => array('hierarchy-list')),
+    '#items' => $hierarchy_item_list,
+    '#attached' => [
+      'js' => [
+        drupal_get_path('module', 'adov_editorial') . '/js/adov_editorial_hierarchy_view_collapsing.js',
+      ],
+    ],
+    '#prefix' => '<div class="hierarchy-list-wrapper hierarchy-list-schedules">',
+    '#suffix' => '</div>',
+  );
+
+  $build['field_zones'] = array(
+    '#title' => t('Zone/s:'),
+    '#weight' => $weight,
+    '#theme' => 'item_list',
+    '#attributes' => array('class' => array('hierarchy-list')),
+    '#items' => $zones,
+    '#required' => TRUE,
+  );
+
+}
+
+/**
+ * Sync Hierarchy values from widget to fields.
+ */
+function adov_audio_schedule_update_hierarchy_values(&$node, $local_market_id, $values) {
+  $values_removed = $values_added = array();
+
+  // Get new selected options.
+  $new_ones = !empty($values) ? $values : array();
+
+  // Check if we already have field collection.
+  if (!empty($node->field_audio_schedules[LANGUAGE_NONE])) {
+    // Get old selected options.
+    $field_collection_item = !empty($node->field_audio_schedules[LANGUAGE_NONE][0]['entity']) ? $node->field_audio_schedules[LANGUAGE_NONE][0]['entity'] : field_collection_item_load($node->field_audio_schedules[LANGUAGE_NONE][0]['value']);
+    $old_ones = adov_schedule_get_selected_options($field_collection_item, array(
+      'field_local_market',
+      'field_stores',
+      'field_regions',
+    ));
+
+    // Sort both old and new options.
+    asort($old_ones);
+    asort($new_ones);
+
+    // Get removed values.
+    $values_removed = array_diff($old_ones, $new_ones);
+
+    // Get added values.
+    $values_added = array_diff($new_ones, $old_ones);
+
+    // Do nothing if there are no changes.
+    if (!$values_removed && !$values_added) {
+      return;
+    }
+  }
+  else {
+    $field_collection_item = entity_create('field_collection_item', array('field_name' => 'field_audio_schedules'));
+    $field_collection_item->setHostEntity('node', $node);
+  }
+
+  // Populate field collection field_stores and field_regions
+  // from values in schedule_target property
+  // previously set in adov_schedule_form_schedule_node_form_validate().
+  $iterator_region = 0;
+  $iterator_store = 0;
+  foreach ($new_ones as $hierarchy_option) {
+    $hierarchy_node = node_load($hierarchy_option);
+    if ($hierarchy_node) {
+      $hierarchy_node_wrapper = entity_metadata_wrapper('node', $hierarchy_node);
+      $target_id = $hierarchy_node_wrapper->getIdentifier();
+      switch ($hierarchy_node_wrapper->getBundle()) {
+        case 'local_market':
+          $field_collection_item->field_local_market[LANGUAGE_NONE][0]['target_id'] = $target_id;
+          break;
+
+        case 'region':
+          $field_collection_item->field_regions[LANGUAGE_NONE][$iterator_region]['target_id'] = $target_id;
+          $iterator_region++;
+          break;
+
+        case 'store':
+          $field_collection_item->field_stores[LANGUAGE_NONE][$iterator_store]['target_id'] = $target_id;
+          $iterator_store++;
+          break;
+
+        default:
+          break;
+      }
+    }
+  }
+
+  // Clear removed values from hierachy options ONLY if we have such.
+  foreach ($values_removed as $removed_option) {
+    foreach (array('field_local_market', 'field_regions', 'field_stores') as $field_name) {
+      if (!empty($field_collection_item->{$field_name}[LANGUAGE_NONE])) {
+        foreach ($field_collection_item->{$field_name}[LANGUAGE_NONE] as $i => $option) {
+          if (empty($option['target_id']) || $option['target_id'] == $removed_option) {
+            unset($field_collection_item->{$field_name}[LANGUAGE_NONE][$i]);
+          }
+        }
+      }
+    }
+  }
+}
+
+/**
+ * Sync Zone values from widget to fields.
+ */
+function adov_audio_schedule_update_multiselect_values(&$node, $field_name, $values) {
+
+  // Check if we already have field collection.
+  if (!empty($node->field_audio_schedules[LANGUAGE_NONE])) {
+    $field_collection_item = !empty($node->field_audio_schedules[LANGUAGE_NONE][0]['entity']) ? $node->field_audio_schedules[LANGUAGE_NONE][0]['entity'] : field_collection_item_load($node->field_audio_schedules[LANGUAGE_NONE][0]['value']);
+
+    // Clear all old values.
+    unset($field_collection_item->{$field_name}[LANGUAGE_NONE]);
+  }
+  else {
+    $field_collection_item = entity_create('field_collection_item', array('field_name' => 'field_audio_schedules'));
+    $field_collection_item->setHostEntity('node', $node);
+  }
+
+  // Populate values.
+  if (!empty($values)) {
+    foreach ($values as $value) {
+      $field_collection_item->{$field_name}[LANGUAGE_NONE][]['target_id'] = $value;
+    }
+  }
+}
+
+/**
+ * Perform custom validation on the hierarchy.
+ */
+function adov_audio_schedule_validate_hierarchy(&$form, &$form_state) {
+  $hierarchy_values = &$form_state['values']['field_audio_schedules'][LANGUAGE_NONE][0];
+
+  foreach (array(
+    'field_local_market' => 'local_market',
+    'field_regions' => 'regions',
+    'field_stores' => 'stores',
+  ) as $field_name => $validate_field) {
+    if (
+      $form['#field_name'] === $field_name &&
+      !empty($hierarchy_values[$field_name][LANGUAGE_NONE])
+    ) {
+      $values = array();
+      foreach ($hierarchy_values[$field_name][LANGUAGE_NONE] as $key => $value) {
+        if (!empty($value) && isset($form_state['hierarchy_data'][$validate_field][$value])) {
+          array_push($values, $value);
+        }
+      }
+      $hierarchy_values[$field_name][LANGUAGE_NONE] = $values;
+    }
+  }
+}
+
+/**
+ * Ajax callback function for the audio_schedule_node_form filter button.
+ */
+function adov_audio_schedule_form_filter_submit($form, &$form_state) {
+
+  // TODO local market should be passed as argument when filtering.
+  $local_market_id = $form_state['local_market_id'];
+
+  // Get submitted filter value.
+  $filter_value = !empty($form_state['input']['audio_schedules']['schedule_options_' . $local_market_id]['filter']) ? $form_state['input']['audio_schedules']['schedule_options_' . $local_market_id]['filter'] : '';
+
+  // Build the new hierarchy tree markup after filter.
+  $local_market = node_load($local_market_id);
+  $variables['hierarchy']['local_market'] = $local_market;
+  $variables['hierarchy']['regions'] = views_get_view_result('schedule_hierarchy', 'hierarchy_region', $local_market_id, $filter_value);
+  $variables['hierarchy']['stores'] = views_get_view_result('schedule_hierarchy', 'hierarchy_store', $local_market_id, $filter_value);
+
+  // Get submitted values to keep checkboxes checked when filtering.
+  $selected_options = $form_state['input']['audio_schedules']['schedule_options_' . $local_market_id]['schedule_hierarchy'];
+  $variables['hierarchy']['selected'] = $selected_options;
+  $variables['hierarchy']['filtered'] = 1;
+
+  $new_markup = theme('adov_audio_schedule_hierarchy', $variables);
+
+  // Create Ajax replace command for replacing the hierarchy tree markup.
+  $commands[] = ajax_command_replace('#schedule-hierarchy-local-market-' . $local_market_id, $new_markup);
+
+  // Return the response with the Ajax replace command added.
+  return array(
+    '#type' => 'ajax',
+    '#commands' => $commands,
+  );
+}
+
+/**
+ * Use after_build function to populate form values on form error.
+ */
+function adov_audio_schedule_after_build($form, $form_state) {
+
+  $local_market_id = $form_state['local_market_id'];
+  $field_collection_id = 'schedule_options_' . $local_market_id;
+
+  // Fix: adovLD-4973.
+  if (isset($form_state['input']['op']) &&
+    ($form_state['input']['op'] == 'Submit' || $form_state['input']['op'] == 'Save' || $form_state['input']['op'] == 'Delete') &&
+    isset($form_state['input']['scr_types_zones'][$field_collection_id]) &&
+    empty($form_state['input']['scr_types_zones'][$field_collection_id]['schedule_zones'])) {
+    $form['scr_types_zones'][$field_collection_id]['schedule_zones']['#default_value'] = array();
+  }
+  elseif (!empty($form_state['values']['scr_types_zones'][$field_collection_id]['schedule_zones'])) {
+    $form['scr_types_zones'][$field_collection_id]['schedule_zones']['#default_value'] = $form_state['values']['scr_types_zones'][$field_collection_id]['schedule_zones'];
+  }
+
+  if (!empty($form_state['input']['audio_schedules']['schedule_options_' . $local_market_id]['schedule_hierarchy'])) {
+    $filter_value = !empty($form_state['values']['audio_schedules'][$field_collection_id]['filter']) ? $form_state['values']['audio_schedules'][$field_collection_id]['filter'] : '';
+
+    $variables['hierarchy']['local_market'] = node_load($local_market_id);
+    $variables['hierarchy']['regions'] = views_get_view_result('schedule_hierarchy', 'hierarchy_region', $local_market_id, $filter_value);
+    $variables['hierarchy']['stores'] = views_get_view_result('schedule_hierarchy', 'hierarchy_store', $local_market_id, $filter_value);
+
+    // Get submitted values to keep checkboxes checked when filtering.
+    $selected_options = $form_state['input']['audio_schedules']['schedule_options_' . $local_market_id]['schedule_hierarchy'];
+    $variables['hierarchy']['selected'] = $selected_options;
+    $variables['hierarchy']['filtered'] = !empty($filter_value);
+
+    // Build hierarchy tree.
+    $form['audio_schedules'][$field_collection_id]['schedule_hierarchy'] = array(
+      '#markup' => theme('adov_audio_schedule_hierarchy', $variables),
+    );
+  }
+
+  return $form;
+}
+
+/**
+ * Implements hook_node_presave().
+ *
+ * We use this hook to populate the selected values
+ * from the custom widget that we have on Schedule node form
+ * for setting hierarchy.
+ */
+function adov_audio_schedule_node_presave($node) {
+
+  // Operate with Shedule nodes ONLY.
+  if ($node->type != 'audio_schedule' || empty($node->local_market_id)) {
+    return;
+  }
+
+  // @TODO it will be multiple local market IDs
+  $local_market_id = $node->local_market_id;
+
+  // Get schedule options from the widget from schedule_target property
+  // previously set in adov_schedule_form_schedule_node_form_validate().
+  $hierarchy_values = !empty($node->schedule_target['schedule_options_' . $local_market_id]['schedule_hierarchy']) ? $node->schedule_target['schedule_options_' . $local_market_id]['schedule_hierarchy'] : array();
+
+  $zones_values = !empty($node->audio_schedules['schedule_options_' . $local_market_id]['schedule_zones']) ? $node->audio_schedules['schedule_options_' . $local_market_id]['schedule_zones'] : array();
+
+  // Sync submitted values from hierarchy tree to fields.
+  adov_audio_schedule_update_hierarchy_values($node, $local_market_id, $hierarchy_values);
+
+  // Sync submitted values from zones multiselect to fields.
+  adov_audio_schedule_update_multiselect_values($node, 'field_zones', $zones_values);
+}
+
+/**
+ * Implements hook_theme().
+ */
+function adov_audio_schedule_theme() {
+  return array(
+    'adov_audio_schedule_hierarchy' => array(
+      'variables' => array(
+        'hierarchy' => array(),
+      ),
+      'path' => drupal_get_path('module', 'adov_schedule') . '/templates',
+      'file' => 'adov_schedule.theme.inc',
+      'template' => 'adov-audio-schedule-hierarchy',
+    ),
+  );
+}
